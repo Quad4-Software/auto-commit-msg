@@ -1,0 +1,14 @@
+diff --git a/store.go b/store.go
+index 111..222 100644
+--- a/store.go
++++ b/store.go
+@@ -40,6 +40,14 @@ func (s *Store) Get(k string) (string, bool) {
+ }
+ 
++func (s *Store) Set(k, v string, ttl time.Duration) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.data[k] = entry{val: v, exp: time.Now().Add(ttl)}
++}
++
+ func main() {}

@@ -13,7 +13,7 @@ Inference runs on CPU against a GGUF model.
 
     auto-commit-msg setup       # download default model (Qwen3-0.6B Q4_K_M)
 
-Or use any qwen2/qwen3 GGUF:
+Or use any supported GGUF:
 
     auto-commit-msg -model /path/model.gguf
     export AUTO_COMMIT_MSG_MODEL=/path/model.gguf
@@ -25,8 +25,9 @@ A GGUF whose general.basename contains "committed" gets the Committed
 fine-tune prompt format and always emits a Conventional Commits line.
 Other models get a generic prompt.
 
-Architectures: qwen2, qwen3. Quants: F32, F16, Q4_0, Q5_0, Q8_0, Q4_K,
-Q5_K, Q6_K.
+Architectures: qwen2, qwen3, llama (Llama 3.x, SmolLM2, TinyLlama).
+Quants: F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K. The chat template
+is picked from the vocab: llama3 header tokens, ChatML, or plain.
 
 ## Usage
 

@@ -27,9 +27,13 @@ func stat(name string, x []float32, t *testing.T) {
 }
 
 func TestTrace(t *testing.T) {
-	data, err := os.ReadFile("../../model.gguf")
+	path := os.Getenv("ACM_TEST_MODEL")
+	if path == "" {
+		path = "../../model.gguf"
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Skip("no model.gguf")
+		t.Skip("no model:", err)
 	}
 	f, err := gguf.Parse(data)
 	if err != nil {
@@ -71,14 +75,14 @@ func TestTrace(t *testing.T) {
 			if l.qNW != nil {
 				rmsnorm(hq, hq, l.qNW, c.RMSEps)
 			}
-			rope(hq, 0, c.RopeDim, m.freqs)
+			rope(hq, 0, c.RopeDim, m.freqs, c.RopeInterleaved)
 		}
 		for head := 0; head < nkv; head++ {
 			hk := k[head*hd : head*hd+hd]
 			if l.kNW != nil {
 				rmsnorm(hk, hk, l.kNW, c.RMSEps)
 			}
-			rope(hk, 0, c.RopeDim, m.freqs)
+			rope(hk, 0, c.RopeDim, m.freqs, c.RopeInterleaved)
 		}
 		kc := make([]float32, kvd)
 		vc := make([]float32, kvd)

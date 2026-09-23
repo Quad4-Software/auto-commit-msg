@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: 0BSD
 
-// Package infer runs decoder-only transformer inference (qwen2/qwen3
-// architecture) on quantized GGUF weights, in pure Go.
+// Package infer runs decoder-only transformer inference (llama/qwen2/qwen3
+// architectures) on quantized GGUF weights, in pure Go.
 package infer
 
 import (
@@ -23,10 +23,20 @@ type Config struct {
 	MaxCtx   int
 	RopeDim  int
 	RopeBase float32
-	RMSEps   float32
-	BOS      int
-	EOS      int
-	EOS2     int // secondary stop token (e.g. <|endoftext|>)
+	// llama-family GGUFs have permuted Q/K weights expecting interleaved
+	// rope pairs (x[2i], x[2i+1]); qwen weights are unpermuted and use the
+	// half-split NeoX convention (x[i], x[i+half]).
+	RopeInterleaved bool
+	// RoPE frequency scaling (llama3/linear). Empty RopeScaling means none.
+	RopeScaling string
+	RopeFactor  float32
+	RopeLoF     float32
+	RopeHiF     float32
+	RopeOrigCtx float32
+	RMSEps      float32
+	BOS         int
+	EOS         int
+	EOS2        int // secondary stop token (e.g. <|endoftext|>)
 }
 
 type layer struct {
@@ -79,8 +89,10 @@ func (s *scratchBufs) for_(nTok, embd, qd, kvd, nff int) {
 
 func Load(f *gguf.File, maxCtx int) (*Model, error) {
 	arch := f.Str("general.architecture")
-	if arch != "qwen3" && arch != "qwen2" {
-		return nil, fmt.Errorf("unsupported architecture %q (want qwen2 or qwen3)", arch)
+	switch arch {
+	case "qwen3", "qwen2", "llama":
+	default:
+		return nil, fmt.Errorf("unsupported architecture %q (want qwen2, qwen3, or llama)", arch)
 	}
 	p := arch + "."
 	c := Config{
@@ -104,7 +116,22 @@ func Load(f *gguf.File, maxCtx int) (*Model, error) {
 	} else {
 		c.HeadDim = c.NEmbd / c.NHead
 	}
+	c.RopeInterleaved = arch == "llama"
 	c.RopeDim = int(f.U64(p+"rope.dimension_count", uint64(c.HeadDim)))
+	c.RopeScaling = f.Str(p + "rope.scaling.type")
+	c.RopeFactor = f.F32(p+"rope.scaling.factor", 0)
+	c.RopeLoF = f.F32(p+"rope.scaling.low_freq_factor", 0)
+	c.RopeHiF = f.F32(p+"rope.scaling.high_freq_factor", 0)
+	c.RopeOrigCtx = f.F32(p+"rope.scaling.original_context_length", 0)
+	if arch == "llama" && c.RopeScaling == "" && c.RopeBase >= 500000 {
+		// Legacy Llama-3.x GGUFs omit the scaling keys; llama.cpp applies
+		// the canonical llama3 values from freq_base/context_length.
+		c.RopeScaling = "llama3"
+		c.RopeFactor = 32
+		c.RopeLoF = 1
+		c.RopeHiF = 4
+		c.RopeOrigCtx = 8192
+	}
 	if c.HeadKV() == 0 || c.NEmbd == 0 || c.NLayers == 0 {
 		return nil, fmt.Errorf("missing required metadata for arch %s", arch)
 	}
@@ -113,10 +140,10 @@ func Load(f *gguf.File, maxCtx int) (*Model, error) {
 	}
 	c.MaxCtx = maxCtx
 	c.EOS2 = -1
-	if arch == "qwen3" || arch == "qwen2" {
-		// <|endoftext|> and <|im_end|> are the two stop tokens for chat models
-		for i, tok := range f.Strs("tokenizer.ggml.tokens") {
-			if tok == "<|endoftext|>" {
+	// secondary stop tokens beyond tokenizer.ggml.eos_token_id
+	for i, tok := range f.Strs("tokenizer.ggml.tokens") {
+		if tok == "<|endoftext|>" || tok == "<|eot_id|>" || tok == "<|end_of_text|>" {
+			if i != c.EOS {
 				c.EOS2 = i
 			}
 		}
@@ -129,7 +156,7 @@ func Load(f *gguf.File, maxCtx int) (*Model, error) {
 		out:   get("output.weight"),
 		kc:    make([][]float32, c.NLayers),
 		vc:    make([][]float32, c.NLayers),
-		freqs: ropeFreqs(c.RopeDim, c.RopeBase),
+		freqs: ropeFreqs(&c),
 	}
 	if on := get("output_norm.weight"); on != nil {
 		m.outNW = normWeight(on)
@@ -207,20 +234,47 @@ var DebugLayer func(li int, x []float32)
 
 // rope applies rotary embeddings to one head vector at position pos.
 // freqs[i] = base^(-2i/dim), precomputed once per model.
-func rope(x []float32, pos int, dim int, freqs []float32) {
+func rope(x []float32, pos int, dim int, freqs []float32, interleaved bool) {
 	half := dim / 2
 	for i := 0; i < half; i++ {
 		c, s := float32(math.Cos(float64(float32(pos)*freqs[i]))), float32(math.Sin(float64(float32(pos)*freqs[i])))
-		a, b := x[i], x[i+half]
-		x[i] = a*c - b*s
-		x[i+half] = a*s + b*c
+		if interleaved {
+			a, b := x[2*i], x[2*i+1]
+			x[2*i] = a*c - b*s
+			x[2*i+1] = a*s + b*c
+		} else {
+			a, b := x[i], x[i+half]
+			x[i] = a*c - b*s
+			x[i+half] = a*s + b*c
+		}
 	}
 }
 
-func ropeFreqs(dim int, base float32) []float32 {
-	f := make([]float32, dim/2)
+func ropeFreqs(c *Config) []float32 {
+	f := make([]float32, c.RopeDim/2)
 	for i := range f {
-		f[i] = 1 / float32(math.Pow(float64(base), float64(2*i)/float64(dim)))
+		f[i] = 1 / float32(math.Pow(float64(c.RopeBase), float64(2*i)/float64(c.RopeDim)))
+	}
+	switch c.RopeScaling {
+	case "linear":
+		for i := range f {
+			f[i] /= c.RopeFactor
+		}
+	case "llama3":
+		// wavelength-based smooth scaling, as llama.cpp does for Llama-3.x
+		loWl := c.RopeOrigCtx / c.RopeLoF
+		hiWl := c.RopeOrigCtx / c.RopeHiF
+		for i := range f {
+			wl := 2 * math.Pi / float64(f[i])
+			switch {
+			case wl < float64(hiWl):
+			case wl > float64(loWl):
+				f[i] /= c.RopeFactor
+			default:
+				smooth := (c.RopeOrigCtx/float32(wl) - c.RopeLoF) / (c.RopeHiF - c.RopeLoF)
+				f[i] = (1-smooth)*f[i]/c.RopeFactor + smooth*f[i]
+			}
+		}
 	}
 	return f
 }
@@ -314,14 +368,14 @@ func (m *Model) Forward(tokens []int) ([]float32, error) {
 				if l.qNW != nil {
 					rmsnorm(hq, hq, l.qNW, c.RMSEps)
 				}
-				rope(hq, pos, c.RopeDim, m.freqs)
+				rope(hq, pos, c.RopeDim, m.freqs, c.RopeInterleaved)
 			}
 			for head := 0; head < nkv; head++ {
 				hk := kj[head*hd : head*hd+hd]
 				if l.kNW != nil {
 					rmsnorm(hk, hk, l.kNW, c.RMSEps)
 				}
-				rope(hk, pos, c.RopeDim, m.freqs)
+				rope(hk, pos, c.RopeDim, m.freqs, c.RopeInterleaved)
 			}
 			copy(kc[pos*kvd:], kj)
 			copy(vc[pos*kvd:], v[j*kvd:j*kvd+kvd])

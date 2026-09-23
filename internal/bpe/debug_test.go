@@ -16,7 +16,10 @@ func TestProbe(t *testing.T) {
 	}
 	f, _ := gguf.Parse(data)
 	tokens := f.Strs("tokenizer.ggml.tokens")
-	tk := New(tokens, f.Strs("tokenizer.ggml.merges"), 151643, 151645, nil)
+	tk := New(tokens, f.Strs("tokenizer.ggml.merges"),
+		int(f.U64("tokenizer.ggml.bos_token_id", 0)),
+		int(f.U64("tokenizer.ggml.eos_token_id", 0)), nil,
+		f.Str("tokenizer.ggml.pre"))
 	for _, s := range []string{"Hello", "Ġworld", "Ġ", "world", "Ġthe", "def", "Ġdef"} {
 		t.Logf("vocab[%q] = %v", s, tk.vocab[s])
 	}
@@ -24,8 +27,8 @@ func TestProbe(t *testing.T) {
 	// simulate bpe on "Ġworld"
 	t.Log("bpe(Ġworld) =", tk.bpe("Ġworld"))
 	t.Log("bpe(Hello) =", tk.bpe("Hello"))
-	t.Log("split:", split("Hello world"))
-	for _, p := range split("Hello world") {
+	t.Log("split:", tk.split("Hello world"))
+	for _, p := range tk.split("Hello world") {
 		t.Logf("piece %q enc %q ids %v", p, tk.encodeBytes(p), tk.bpe(tk.encodeBytes(p)))
 	}
 }

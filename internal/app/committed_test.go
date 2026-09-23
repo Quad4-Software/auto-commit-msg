@@ -36,7 +36,8 @@ func TestCommittedModel(t *testing.T) {
 	}
 	tok := bpe.New(tokens, f.Strs("tokenizer.ggml.merges"),
 		int(f.U64("tokenizer.ggml.bos_token_id", 0)),
-		int(f.U64("tokenizer.ggml.eos_token_id", 0)), specials)
+		int(f.U64("tokenizer.ggml.eos_token_id", 0)), specials,
+		f.Str("tokenizer.ggml.pre"))
 	m, err := infer.Load(f, 2048)
 	if err != nil {
 		t.Fatal(err)

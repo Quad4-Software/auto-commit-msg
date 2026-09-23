@@ -148,6 +148,40 @@ Write the description so that:
 
 var conventionalRe = regexp.MustCompile(`^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+`)
 
+func isCommitted(f *gguf.File) bool {
+	return strings.Contains(strings.ToLower(f.Str("general.basename")), "committed")
+}
+
+// buildPrompt wraps the system prompt and diff in the chat template the
+// model was trained with, detected from its vocab. committed-* models get
+// their exact training prompt verbatim.
+func buildPrompt(f *gguf.File, tok *bpe.Tokenizer, arch, diffText string, conventional bool) string {
+	if strings.Contains(strings.ToLower(f.Str("general.basename")), "committed") {
+		return "<|im_start|>system\n" + committedSys + "<|im_end|>\n" +
+			"<|im_start|>user\nDiff:\n" + diffText + "\n\n/no_think<|im_end|>\n" +
+			"<|im_start|>assistant\n<think>\n\n</think>\n\n"
+	}
+	sys := systemPrompt(conventional)
+	if _, ok := tok.ID("<|start_header_id|>"); ok {
+		// llama3 header format
+		return "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n" +
+			sys + "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" +
+			diffText + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+	}
+	if _, ok := tok.ID("<|im_start|>"); ok {
+		// ChatML; the empty think block only exists on qwen3
+		think := ""
+		if arch == "qwen3" {
+			think = "<think>\n\n</think>\n\n"
+		}
+		return "<|im_start|>system\n" + sys + "<|im_end|>\n" +
+			"<|im_start|>user\n" + diffText + "<|im_end|>\n" +
+			"<|im_start|>assistant\n" + think
+	}
+	// no chat template tokens: plain fallback
+	return "System: " + sys + "\n\nUser: " + diffText + "\n\nAssistant: "
+}
+
 // cleanup extracts a single subject line from raw model output.
 func cleanup(s string) string {
 	// drop <think>...</think> blocks if the model emitted them anyway
@@ -214,7 +248,8 @@ func Generate(o *Options) (string, error) {
 	}
 	tok := bpe.New(tokens, f.Strs("tokenizer.ggml.merges"),
 		int(f.U64("tokenizer.ggml.bos_token_id", 0)),
-		int(f.U64("tokenizer.ggml.eos_token_id", 0)), specials)
+		int(f.U64("tokenizer.ggml.eos_token_id", 0)), specials,
+		f.Str("tokenizer.ggml.pre"))
 	m, err := infer.Load(f, o.Context)
 	if err != nil {
 		return "", err
@@ -224,20 +259,12 @@ func Generate(o *Options) (string, error) {
 	diffIDs := tok.Encode(diffText)
 	diffText = compressDiff(diffText, o.MaxDiffTokens, tok)
 
-	// committed fine-tunes are conditioned on their training prompt, so use
-	// it verbatim; other models get the generic instruction prompt.
-	committed := strings.Contains(strings.ToLower(f.Str("general.basename")), "committed")
-	var prompt string
-	if committed {
-		prompt = "<|im_start|>system\n" + committedSys + "<|im_end|>\n" +
-			"<|im_start|>user\nDiff:\n" + diffText + "\n\n/no_think<|im_end|>\n" +
-			"<|im_start|>assistant\n<think>\n\n</think>\n\n"
-	} else {
-		prompt = "<|im_start|>system\n" + systemPrompt(o.Conventional) + "<|im_end|>\n" +
-			"<|im_start|>user\n" + diffText + "<|im_end|>\n" +
-			"<|im_start|>assistant\n<think>\n\n</think>\n\n"
-	}
+	prompt := buildPrompt(f, tok, m.Cfg.Arch, diffText, o.Conventional)
 	ids := tok.Encode(prompt)
+	if f.U64("tokenizer.ggml.add_bos_token", 0) == 1 &&
+		(len(ids) == 0 || ids[0] != m.Cfg.BOS) {
+		ids = append([]int{m.Cfg.BOS}, ids...)
+	}
 	if o.Verbose {
 		fmt.Fprintf(os.Stderr, "prompt: %d tokens (diff %d), ctx %d, load %v\n",
 			len(ids), len(diffIDs), o.Context, loadTime.Round(time.Millisecond))
@@ -262,12 +289,13 @@ func Generate(o *Options) (string, error) {
 				st.PrefillToks, st.Prefill.Round(time.Millisecond), float64(st.PrefillToks)/st.Prefill.Seconds(),
 				st.DecodeToks, st.Decode.Round(time.Millisecond), float64(st.DecodeToks)/st.Decode.Seconds(),
 				peakRSS())
+			fmt.Fprintf(os.Stderr, "raw: %q\n", tok.Decode(gen))
 		}
 		msg := cleanup(tok.Decode(gen))
 		if msg == "" {
 			continue
 		}
-		if (o.Conventional || committed) && !conventionalRe.MatchString(msg) {
+		if (o.Conventional || isCommitted(f)) && !conventionalRe.MatchString(msg) {
 			continue
 		}
 		return msg, nil

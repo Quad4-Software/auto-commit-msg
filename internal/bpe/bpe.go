@@ -23,6 +23,25 @@ type Tokenizer struct {
 	runeB    map[rune]byte
 	BOS      int
 	EOS      int
+	pre      int // pre-tokenizer variant
+}
+
+// Pre-tokenizer regex families, matching llama.cpp tokenizer.ggml.pre values.
+const (
+	preQwen2  = iota // qwen2: \p{N} single digits
+	preLlama3        // llama3/smollm: \p{N}{1,3}, CJK chars solo
+	preGPT2          // classic gpt2: space-prefixed classes
+)
+
+func preByName(name string) int {
+	switch name {
+	case "qwen2":
+		return preQwen2
+	case "llama-bpe", "llama3", "llama-v3", "smollm":
+		return preLlama3
+	default:
+		return preGPT2
+	}
 }
 
 type special struct {
@@ -32,9 +51,11 @@ type special struct {
 
 // New builds a tokenizer from GGUF metadata arrays. specialIDs lists token
 // ids (typically control and user-defined token types) that are matched
-// literally in the input text; nil means none.
-func New(tokens, merges []string, bos, eos int, specialIDs []int) *Tokenizer {
+// literally in the input text; nil means none. pre is the value of
+// tokenizer.ggml.pre ("" selects the generic gpt2 splitter).
+func New(tokens, merges []string, bos, eos int, specialIDs []int, pre string) *Tokenizer {
 	t := &Tokenizer{
+		pre:    preByName(pre),
 		vocab:  make(map[string]int, len(tokens)),
 		tokens: tokens,
 		merges: make(map[[2]string]int, len(merges)),
@@ -110,13 +131,13 @@ func isContractionLead(r rune) bool {
 	return !isLetter(r) && !isDigit(r) && r != '\r' && r != '\n'
 }
 
-// split pre-tokenizes s into pieces following the qwen2 regex order.
-func split(s string) []string {
+// split pre-tokenizes s into pieces following the selected regex family.
+func (t *Tokenizer) split(s string) []string {
 	rs := []rune(s)
 	var out []string
 	i := 0
 	for i < len(rs) {
-		size := matchPiece(rs[i:])
+		size := t.matchPiece(rs[i:])
 		if size == 0 {
 			size = 1
 		}
@@ -126,9 +147,14 @@ func split(s string) []string {
 	return out
 }
 
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) ||
+		unicode.Is(unicode.Katakana, r)
+}
+
 // matchPiece returns the length of the first regex alternative matching at
 // position 0 of rs.
-func matchPiece(rs []rune) int {
+func (t *Tokenizer) matchPiece(rs []rune) int {
 	r0 := rs[0]
 	// 's 't 're 've 'm 'll 'd (case-insensitive)
 	if r0 == '\'' && len(rs) > 1 {
@@ -143,9 +169,17 @@ func matchPiece(rs []rune) int {
 			return 2
 		}
 	}
-	// [^\r\n\p{L}\p{N}]?\p{L}+
+	// smollm splits CJK characters into single-char pieces
+	if t.pre == preLlama3 && isCJK(r0) {
+		return 1
+	}
+	// letters: [^\r\n\p{L}\p{N}]?\p{L}+ (qwen2/llama3) or " ?\p{L}+" (gpt2)
 	j := 0
-	if !isLetter(r0) && isContractionLead(r0) {
+	if t.pre == preGPT2 {
+		if r0 == ' ' && len(rs) > 1 && isLetter(rs[1]) {
+			j = 1
+		}
+	} else if !isLetter(r0) && isContractionLead(r0) {
 		j = 1
 	}
 	k := j
@@ -155,11 +189,31 @@ func matchPiece(rs []rune) int {
 	if k > j {
 		return k
 	}
-	// \p{N} (single digit)
-	if isDigit(r0) {
+	// digits: \p{N} (qwen2), \p{N}{1,3} (llama3), " ?\p{N}+" (gpt2)
+	if t.pre == preGPT2 {
+		j = 0
+		if r0 == ' ' && len(rs) > 1 && isDigit(rs[1]) {
+			j = 1
+		}
+		k = j
+		for k < len(rs) && isDigit(rs[k]) {
+			k++
+		}
+		if k > j {
+			return k
+		}
+	} else if isDigit(r0) {
+		if t.pre == preLlama3 {
+			n := 1
+			for n < 3 && n < len(rs) && isDigit(rs[n]) {
+				n++
+			}
+			return n
+		}
 		return 1
 	}
-	//  ?[^\s\p{L}\p{N}]+[\r\n]*
+	// punct run: " ?[^\s\p{L}\p{N}]+" with optional trailing [\r\n]* on
+	// qwen2/llama3
 	j = 0
 	if r0 == ' ' && len(rs) > 1 && isPunct(rs[1]) {
 		j = 1
@@ -169,18 +223,20 @@ func matchPiece(rs []rune) int {
 		for k < len(rs) && isPunct(rs[k]) {
 			k++
 		}
-		for k < len(rs) && (rs[k] == '\r' || rs[k] == '\n') {
-			k++
+		if t.pre != preGPT2 {
+			for k < len(rs) && (rs[k] == '\r' || rs[k] == '\n') {
+				k++
+			}
 		}
 		return k
 	}
-	// \s*[\r\n]+
+	// whitespace: \s*[\r\n]+ first (except gpt2), then \s+(?!\S) / \s+
 	if isSpace(r0) {
-		k = 0
+		k := 0
 		for k < len(rs) && isSpace(rs[k]) && rs[k] != '\r' && rs[k] != '\n' {
 			k++
 		}
-		if k < len(rs) && (rs[k] == '\r' || rs[k] == '\n') {
+		if t.pre != preGPT2 && k < len(rs) && (rs[k] == '\r' || rs[k] == '\n') {
 			k++
 			for k < len(rs) && (rs[k] == '\r' || rs[k] == '\n') {
 				k++
@@ -211,7 +267,7 @@ func (t *Tokenizer) Encode(s string) []int {
 		matched := false
 		for _, sp := range t.specials {
 			if strings.HasPrefix(s[i:], sp.s) {
-				for _, piece := range split(s[mark:i]) {
+				for _, piece := range t.split(s[mark:i]) {
 					for _, id := range t.bpe(t.encodeBytes(piece)) {
 						ids = append(ids, id)
 					}
@@ -227,7 +283,7 @@ func (t *Tokenizer) Encode(s string) []int {
 			i++
 		}
 	}
-	for _, piece := range split(s[mark:]) {
+	for _, piece := range t.split(s[mark:]) {
 		for _, id := range t.bpe(t.encodeBytes(piece)) {
 			ids = append(ids, id)
 		}
