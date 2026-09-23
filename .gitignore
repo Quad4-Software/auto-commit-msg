@@ -1,0 +1,19 @@
+auto-commit-msg
+auto-commit-msg-fat
+
+# models
+*.gguf
+*.part
+
+# profiling / bench artifacts
+*.pprof
+*.prof
+cpu.out
+mem.out
+
+# local training artifacts (if training/ comes back)
+.hf-cache/
+data/
+out-adapter/
+merged/
+checkpoint-*/
